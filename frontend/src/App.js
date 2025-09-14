@@ -80,16 +80,16 @@ const ProgressivePricingForm = () => {
     }
   }, [API_BASE_URL, BASE_PRICING_URL]);
 
-  // Base price calculation (manufacturer + appliance)
+  // Base price calculation - most progressive version (triggers on manufacturer + appliance)
   useEffect(() => {
-    if (formData.manufacturer && formData.appliance && formData.brand && formData.type) {
+    if (formData.manufacturer && formData.appliance) {
       setLoading(prev => ({ ...prev, basePrice: true }));
       
       apiCall('/api/pricing/base', {
         manufacturer: formData.manufacturer,
         appliance: formData.appliance,
-        brand: formData.brand,
-        type: formData.type,
+        brand: formData.brand || '', // Send empty string if no brand selected yet
+        type: formData.type || '',   // Send empty string if no type selected yet
         sessionId
       }).then(response => {
         console.log('Base pricing response:', response);
@@ -112,6 +112,14 @@ const ProgressivePricingForm = () => {
       }).finally(() => {
         setLoading(prev => ({ ...prev, basePrice: false }));
       });
+    } else {
+      // Reset pricing when manufacturer or appliance is cleared
+      setPricing(prev => ({
+        ...prev,
+        basePrice: 0,
+        breakdown: [],
+        finalPrice: 0 + prev.tax - prev.segmentDiscount
+      }));
     }
   }, [formData.manufacturer, formData.appliance, formData.brand, formData.type, sessionId, apiCall]);
 
@@ -313,12 +321,17 @@ const ProgressivePricingForm = () => {
                   <label className="block text-sm font-medium text-gray-700 mb-1">
                     Brand
                   </label>
-                  <input
-                    type="text"
+                  <select
                     value={formData.brand}
                     onChange={(e) => handleInputChange('brand', e.target.value)}
-                    placeholder="Enter brand model"
-                  />
+                  >
+                    <option value="">Select brand</option>
+                    <option value="Amana">Amana</option>
+                    <option value="Whirlpool">Whirlpool</option>
+                    <option value="Maytag">Maytag</option>
+                    <option value="KitchenAid">KitchenAid</option>
+                    <option value="JennAir">JennAir</option>
+                  </select>
                 </div>
 
                 <div>
