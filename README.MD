@@ -267,17 +267,17 @@ curl http://localhost:3001/health
 # Test base pricing endpoint
 curl -X POST http://localhost:3001/api/pricing/base \
   -H "Content-Type: application/json" \
-  -d '{"manufacturer":"whirlpool","appliance":"washing-machine","brand":"Cabrio","type":"Top Load","sessionId":"test_session_123"}'
+  -d '{"manufacturer":"whirlpool","appliance":"washing-machine","brand":"Cabrio","type":"Top Load","sessionId":"test_session_123"}'| jq
 
 # Test tax calculation endpoint  
 curl -X POST http://localhost:3001/api/pricing/tax \
   -H "Content-Type: application/json" \
-  -d '{"state":"CA","basePrice":450,"sessionId":"test_session_123"}'
+  -d '{"state":"CA","basePrice":450,"sessionId":"test_session_123"}'| jq
 
 # Test segment discount endpoint
 curl -X POST http://localhost:3001/api/pricing/segment \
   -H "Content-Type: application/json" \
-  -d '{"customerSegment":"premium","basePrice":450,"sessionId":"test_session_123"}'
+  -d '{"customerSegment":"premium","basePrice":450,"sessionId":"test_session_123"}'| jq
 ```
 
 #### 3. Full Submission Test
