@@ -1,115 +1,239 @@
-// server.js - Main Express server
+// server.js - Complete backend server for progressive pricing service
 const express = require('express');
 const cors = require('cors');
 const redis = require('redis');
 const mysql = require('mysql2/promise');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+const morgan = require('morgan');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// Security middleware
+app.use(helmet());
+app.use(compression());
 
-// Redis Client
-const redisClient = redis.createClient({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: process.env.REDIS_PORT || 6379,
-  password: process.env.REDIS_PASSWORD || undefined
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: process.env.RATE_LIMIT_MAX || 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.'
 });
+app.use('/api/', limiter);
 
-redisClient.on('error', (err) => console.log('Redis Client Error', err));
-redisClient.connect();
+// CORS configuration
+const corsOptions = {
+  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+app.use(cors(corsOptions));
 
-// MySQL Connection Pool
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
-});
+// Body parsing middleware
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Pricing calculation functions
-class PricingEngine {
-  static async getBasePrice(manufacturer, appliance, brand, type) {
-    // Simulate complex pricing logic
-    const basePrices = {
-      'whirlpool': { 'washing-machine': 450, 'refrigerator': 800, 'dishwasher': 350, 'dryer': 400 },
-      'ge': { 'washing-machine': 420, 'refrigerator': 750, 'dishwasher': 320, 'dryer': 380 },
-      'samsung': { 'washing-machine': 520, 'refrigerator': 900, 'dishwasher': 400, 'dryer': 450 },
-      'lg': { 'washing-machine': 500, 'refrigerator': 850, 'dishwasher': 380, 'dryer': 430 }
-    };
+// Logging middleware
+if (process.env.NODE_ENV !== 'test') {
+  app.use(morgan('combined'));
+}
 
-    const basePrice = basePrices[manufacturer]?.[appliance] || 300;
-    
-    // Add premium for specific brands/types
-    let premium = 0;
-    if (brand && brand.toLowerCase().includes('premium')) premium += 100;
-    if (type && type.toLowerCase().includes('smart')) premium += 150;
+// Redis Client Setup
+let redisClient;
 
-    return {
-      basePrice: basePrice + premium,
-      breakdown: [
-        `Base price for ${manufacturer} ${appliance}`,
-        ...(premium > 0 ? [`Premium features: +$${premium}`] : [])
-      ]
-    };
-  }
+async function initializeRedis() {
+  try {
+    redisClient = redis.createClient({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: process.env.REDIS_PORT || 6379,
+      password: process.env.REDIS_PASSWORD || undefined,
+      retry_strategy: (options) => {
+        if (options.error && options.error.code === 'ECONNREFUSED') {
+          console.error('Redis connection refused');
+          return new Error('Redis connection refused');
+        }
+        if (options.total_retry_time > 1000 * 60 * 60) {
+          return new Error('Redis retry time exhausted');
+        }
+        if (options.attempt > 10) {
+          return undefined;
+        }
+        return Math.min(options.attempt * 100, 3000);
+      }
+    });
 
-  static async calculateTax(state, basePrice) {
-    const taxRates = {
-      'CA': 0.0875,
-      'NY': 0.08,
-      'TX': 0.0625,
-      'FL': 0.06,
-      'WA': 0.065
-    };
+    redisClient.on('error', (err) => {
+      console.error('Redis Client Error:', err);
+    });
 
-    const taxRate = taxRates[state] || 0.05;
-    const tax = Math.round(basePrice * taxRate);
+    redisClient.on('connect', () => {
+      console.log('✅ Connected to Redis');
+    });
 
-    return {
-      tax,
-      taxRate: taxRate * 100,
-      breakdown: [`${(taxRate * 100).toFixed(2)}% tax for ${state}`]
-    };
-  }
-
-  static async getSegmentDiscount(customerSegment, basePrice) {
-    const discountRates = {
-      'premium': 0.15,
-      'standard': 0.05,
-      'basic': 0
-    };
-
-    const discountRate = discountRates[customerSegment] || 0;
-    const discount = Math.round(basePrice * discountRate);
-
-    return {
-      segmentDiscount: discount,
-      discountRate: discountRate * 100,
-      breakdown: discount > 0 ? [`${(discountRate * 100)}% ${customerSegment} customer discount`] : []
-    };
+    await redisClient.connect();
+  } catch (error) {
+    console.error('Failed to initialize Redis:', error);
+    process.exit(1);
   }
 }
 
-// Cache helper functions
+// MySQL Connection Pool
+const pool = mysql.createPool({
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME || 'appliance_registration',
+  port: process.env.DB_PORT || 3306,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+  acquireTimeout: 60000,
+  timeout: 60000
+});
+
+// Test database connection
+async function testDatabaseConnection() {
+  try {
+    const connection = await pool.getConnection();
+    console.log('✅ Connected to MySQL Database');
+    connection.release();
+  } catch (error) {
+    console.error('❌ Database connection failed:', error);
+    process.exit(1);
+  }
+}
+
+// Pricing calculation engine
+class PricingEngine {
+  static async getBasePrice(manufacturer, appliance, brand, type) {
+    console.log('Calculating base price for:', { manufacturer, appliance, brand, type });
+    
+    // Base pricing matrix
+    const basePrices = {
+      'whirlpool': { 
+        'washing-machine': 450, 
+        'refrigerator': 800, 
+        'dishwasher': 350, 
+        'dryer': 400 
+      },
+      'ge': { 
+        'washing-machine': 420, 
+        'refrigerator': 750, 
+        'dishwasher': 320, 
+        'dryer': 380 
+      },
+      'samsung': { 
+        'washing-machine': 520, 
+        'refrigerator': 900, 
+        'dishwasher': 400, 
+        'dryer': 450 
+      },
+      'lg': { 
+        'washing-machine': 500, 
+        'refrigerator': 850, 
+        'dishwasher': 380, 
+        'dryer': 430 
+      }
+    };
+
+    const basePrice = basePrices[manufacturer.toLowerCase()]?.[appliance.toLowerCase()] || 300;
+    
+    // Add premiums for specific features
+    let premium = 0;
+    const brandLower = (brand || '').toLowerCase();
+    const typeLower = (type || '').toLowerCase();
+    
+    if (brandLower.includes('premium') || brandLower.includes('deluxe')) premium += 100;
+    if (typeLower.includes('smart') || typeLower.includes('wifi')) premium += 150;
+    if (typeLower.includes('energy star') || typeLower.includes('efficient')) premium += 75;
+    if (typeLower.includes('stainless') || typeLower.includes('steel')) premium += 50;
+
+    const finalPrice = basePrice + premium;
+    
+    const breakdown = [
+      `Base price for ${manufacturer} ${appliance}: $${basePrice}`,
+      ...(premium > 0 ? [`Premium features bonus: +$${premium}`] : [])
+    ];
+
+    console.log('Base price calculation result:', { basePrice: finalPrice, breakdown });
+    return { basePrice: finalPrice, breakdown };
+  }
+
+  static async calculateTax(state, basePrice) {
+    console.log('Calculating tax for:', { state, basePrice });
+    
+    // State tax rates
+    const taxRates = {
+      'CA': 0.0875,  // California
+      'NY': 0.08,    // New York
+      'TX': 0.0625,  // Texas
+      'FL': 0.06,    // Florida
+      'WA': 0.065,   // Washington
+      'IL': 0.0625,  // Illinois
+      'PA': 0.06,    // Pennsylvania
+      'OH': 0.0575,  // Ohio
+      'GA': 0.04,    // Georgia
+      'NC': 0.0475   // North Carolina
+    };
+
+    const taxRate = taxRates[state.toUpperCase()] || 0.05; // Default 5%
+    const tax = Math.round(basePrice * taxRate * 100) / 100; // Round to 2 decimal places
+
+    const breakdown = [`${(taxRate * 100).toFixed(2)}% sales tax for ${state.toUpperCase()}: $${tax.toFixed(2)}`];
+
+    console.log('Tax calculation result:', { tax, taxRate: taxRate * 100, breakdown });
+    return { tax, taxRate: taxRate * 100, breakdown };
+  }
+
+  static async getSegmentDiscount(customerSegment, basePrice) {
+    console.log('Calculating segment discount for:', { customerSegment, basePrice });
+    
+    // Customer segment discount rates
+    const discountRates = {
+      'premium': 0.15,    // 15% discount
+      'standard': 0.05,   // 5% discount
+      'basic': 0          // No discount
+    };
+
+    const discountRate = discountRates[customerSegment.toLowerCase()] || 0;
+    const discount = Math.round(basePrice * discountRate * 100) / 100;
+
+    const breakdown = discount > 0 
+      ? [`${(discountRate * 100)}% ${customerSegment} customer discount: -$${discount.toFixed(2)}`] 
+      : [`No discount for ${customerSegment} customers`];
+
+    console.log('Segment discount result:', { segmentDiscount: discount, discountRate: discountRate * 100, breakdown });
+    return { segmentDiscount: discount, discountRate: discountRate * 100, breakdown };
+  }
+}
+
+// Cache management utilities
 class CacheManager {
   static generateKey(sessionId, step) {
     return `pricing:${sessionId}:${step}`;
   }
 
   static async set(key, data, expiration = 3600) {
-    await redisClient.setEx(key, expiration, JSON.stringify(data));
+    try {
+      await redisClient.setEx(key, expiration, JSON.stringify(data));
+      console.log('Cache set:', key);
+    } catch (error) {
+      console.error('Cache set error:', error);
+    }
   }
 
   static async get(key) {
-    const data = await redisClient.get(key);
-    return data ? JSON.parse(data) : null;
+    try {
+      const data = await redisClient.get(key);
+      console.log('Cache get:', key, data ? 'HIT' : 'MISS');
+      return data ? JSON.parse(data) : null;
+    } catch (error) {
+      console.error('Cache get error:', error);
+      return null;
+    }
   }
 
   static async getSessionData(sessionId) {
@@ -124,20 +248,66 @@ class CacheManager {
       }
     }
 
+    console.log('Retrieved session data for:', sessionId, Object.keys(data));
     return data;
+  }
+
+  static async clearSession(sessionId) {
+    const steps = ['base', 'tax', 'segment'];
+    for (const step of steps) {
+      const key = this.generateKey(sessionId, step);
+      try {
+        await redisClient.del(key);
+        console.log('Cache cleared:', key);
+      } catch (error) {
+        console.error('Cache clear error:', error);
+      }
+    }
   }
 }
 
 // API Routes
 
-// Base price endpoint
+// Health check endpoint
+app.get('/health', async (req, res) => {
+  try {
+    // Check Redis connection
+    await redisClient.ping();
+    
+    // Check MySQL connection
+    await pool.execute('SELECT 1');
+    
+    res.json({ 
+      status: 'healthy', 
+      timestamp: new Date().toISOString(),
+      services: {
+        redis: 'connected',
+        mysql: 'connected'
+      }
+    });
+  } catch (error) {
+    console.error('Health check failed:', error);
+    res.status(500).json({ 
+      status: 'unhealthy', 
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Base price calculation endpoint
 app.post('/api/pricing/base', async (req, res) => {
   try {
     const { manufacturer, appliance, brand, type, sessionId } = req.body;
 
+    // Validation
     if (!manufacturer || !appliance || !sessionId) {
-      return res.status(400).json({ error: 'Missing required fields' });
+      return res.status(400).json({ 
+        error: 'Missing required fields: manufacturer, appliance, sessionId' 
+      });
     }
+
+    console.log('Base price request:', { manufacturer, appliance, brand, type, sessionId });
 
     const result = await PricingEngine.getBasePrice(manufacturer, appliance, brand, type);
     
@@ -152,7 +322,7 @@ app.post('/api/pricing/base', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Base pricing error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error calculating base price' });
   }
 });
 
@@ -161,9 +331,20 @@ app.post('/api/pricing/tax', async (req, res) => {
   try {
     const { state, basePrice, sessionId } = req.body;
 
+    // Validation
     if (!state || !basePrice || !sessionId) {
-      return res.status(400).json({ error: 'Missing required fields' });
+      return res.status(400).json({ 
+        error: 'Missing required fields: state, basePrice, sessionId' 
+      });
     }
+
+    if (isNaN(basePrice) || basePrice <= 0) {
+      return res.status(400).json({ 
+        error: 'Invalid basePrice: must be a positive number' 
+      });
+    }
+
+    console.log('Tax calculation request:', { state, basePrice, sessionId });
 
     const result = await PricingEngine.calculateTax(state, basePrice);
     
@@ -178,7 +359,7 @@ app.post('/api/pricing/tax', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Tax calculation error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error calculating tax' });
   }
 });
 
@@ -187,9 +368,20 @@ app.post('/api/pricing/segment', async (req, res) => {
   try {
     const { customerSegment, basePrice, sessionId } = req.body;
 
+    // Validation
     if (!customerSegment || !basePrice || !sessionId) {
-      return res.status(400).json({ error: 'Missing required fields' });
+      return res.status(400).json({ 
+        error: 'Missing required fields: customerSegment, basePrice, sessionId' 
+      });
     }
+
+    if (isNaN(basePrice) || basePrice <= 0) {
+      return res.status(400).json({ 
+        error: 'Invalid basePrice: must be a positive number' 
+      });
+    }
+
+    console.log('Segment discount request:', { customerSegment, basePrice, sessionId });
 
     const result = await PricingEngine.getSegmentDiscount(customerSegment, basePrice);
     
@@ -204,7 +396,7 @@ app.post('/api/pricing/segment', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Segment pricing error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error calculating segment discount' });
   }
 });
 
@@ -213,20 +405,35 @@ app.post('/api/submit', async (req, res) => {
   try {
     const { sessionId, ...formData } = req.body;
 
+    // Validation
     if (!sessionId) {
       return res.status(400).json({ error: 'Session ID is required' });
     }
 
+    const requiredFields = ['firstName', 'lastName', 'email', 'phone', 'manufacturer', 'appliance', 'state', 'customerSegment'];
+    const missingFields = requiredFields.filter(field => !formData[field]);
+    
+    if (missingFields.length > 0) {
+      return res.status(400).json({ 
+        error: `Missing required fields: ${missingFields.join(', ')}` 
+      });
+    }
+
+    console.log('Order submission request:', { sessionId, formData });
+
     // Retrieve all cached pricing data
     const cachedPricing = await CacheManager.getSessionData(sessionId);
+    console.log('Retrieved cached pricing:', cachedPricing);
     
     // Calculate final price from cached data
     const basePrice = cachedPricing.base?.basePrice || 0;
     const tax = cachedPricing.tax?.tax || 0;
     const discount = cachedPricing.segment?.segmentDiscount || 0;
-    const finalPrice = basePrice + tax - discount;
+    const finalPrice = Math.round((basePrice + tax - discount) * 100) / 100;
 
-    // Insert into MySQL database
+    console.log('Final pricing calculation:', { basePrice, tax, discount, finalPrice });
+
+    // Database transaction
     const connection = await pool.getConnection();
     
     try {
@@ -240,6 +447,7 @@ app.post('/api/submit', async (req, res) => {
       );
 
       const customerId = customerResult.insertId;
+      console.log('Customer created with ID:', customerId);
 
       // Insert order data
       const [orderResult] = await connection.execute(
@@ -265,24 +473,25 @@ app.post('/api/submit', async (req, res) => {
         ]
       );
 
+      const orderId = orderResult.insertId;
+      console.log('Order created with ID:', orderId);
+
       await connection.commit();
 
       // Clean up cache after successful submission
-      const steps = ['base', 'tax', 'segment'];
-      for (const step of steps) {
-        const key = CacheManager.generateKey(sessionId, step);
-        await redisClient.del(key);
-      }
+      await CacheManager.clearSession(sessionId);
 
       res.json({
         success: true,
-        orderId: `ORD_${orderResult.insertId}`,
+        orderId: `ORD_${orderId.toString().padStart(6, '0')}`,
         customerId: customerId,
-        finalPrice: finalPrice
+        finalPrice: finalPrice,
+        message: 'Order submitted successfully'
       });
 
     } catch (dbError) {
       await connection.rollback();
+      console.error('Database transaction failed:', dbError);
       throw dbError;
     } finally {
       connection.release();
@@ -290,34 +499,74 @@ app.post('/api/submit', async (req, res) => {
 
   } catch (error) {
     console.error('Submission error:', error);
-    res.status(500).json({ error: 'Failed to submit order' });
-  }
-});
-
-// Health check endpoint
-app.get('/health', async (req, res) => {
-  try {
-    // Check Redis connection
-    await redisClient.ping();
-    
-    // Check MySQL connection
-    await pool.execute('SELECT 1');
-    
-    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
-  } catch (error) {
-    res.status(500).json({ status: 'unhealthy', error: error.message });
+    res.status(500).json({ 
+      error: 'Failed to submit order. Please try again.',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: 'Something went wrong!' });
+  console.error('Unhandled error:', err.stack);
+  res.status(500).json({ 
+    error: 'Something went wrong!',
+    details: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// 404 handler - catch all unmatched routes
+app.use((req, res) => {
+  res.status(404).json({ 
+    error: 'Endpoint not found',
+    path: req.originalUrl,
+    method: req.method
+  });
 });
+
+// Initialize services and start server
+async function startServer() {
+  try {
+    console.log('🚀 Starting Progressive Pricing Service...');
+    
+    // Initialize Redis
+    await initializeRedis();
+    
+    // Test database connection
+    await testDatabaseConnection();
+    
+    // Start the server
+    app.listen(PORT, () => {
+      console.log(`✅ Server running on port ${PORT}`);
+      console.log(`🔗 API available at: http://localhost:${PORT}`);
+      console.log(`🏥 Health check: http://localhost:${PORT}/health`);
+      console.log(`🎯 Ready to receive requests from frontend!`);
+    });
+    
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down gracefully...');
+  
+  try {
+    await redisClient.quit();
+    await pool.end();
+    console.log('✅ Connections closed');
+    process.exit(0);
+  } catch (error) {
+    console.error('Error during shutdown:', error);
+    process.exit(1);
+  }
+});
+
+// Start the server
+if (require.main === module) {
+  startServer();
+}
 
 module.exports = app;
