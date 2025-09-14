@@ -312,6 +312,63 @@ CREATE TABLE customer_segments (
 - Adjust cache TTL values if needed
 - Check for memory leaks in long-running processes
 
+## Redis Security Configuration
+
+### Development vs Production
+
+**Current Development Setup (No Password)**:
+```bash
+# Redis configuration
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=
+# Empty password = no authentication required
+```
+
+**Why No Password in Development**:
+- **Docker Network Isolation**: Redis container only accessible from localhost
+- **Development Speed**: No authentication overhead during testing
+- **Default Behavior**: Redis starts without auth by default
+- **Security Sufficient**: Local development poses minimal security risk
+
+**Production Requirements**:
+```bash
+# Production Redis configuration
+REDIS_HOST=your-cluster.cache.amazonaws.com
+REDIS_PORT=6379
+REDIS_PASSWORD=strong_random_password_here
+REDIS_TLS=true
+```
+
+### Adding Redis Authentication (Optional)
+
+If you want to simulate production security locally:
+
+**1. Update docker-compose.yml**:
+```yaml
+redis:
+  image: redis:alpine
+  ports:
+    - "6379:6379"
+  command: redis-server --requirepass "dev_password_123"
+```
+
+**2. Update all .env files**:
+```bash
+REDIS_PASSWORD=dev_password_123
+```
+
+**3. Redis client will automatically use password if provided**:
+```javascript
+const redisClient = redis.createClient({
+  host: process.env.REDIS_HOST,
+  port: process.env.REDIS_PORT,
+  password: process.env.REDIS_PASSWORD || undefined
+});
+```
+
+**Security Note**: The current passwordless setup is appropriate for local development but should never be used in shared or production environments.
+
 ## Configuration
 
 ### Environment Variables
@@ -327,12 +384,25 @@ DB_USER=root
 DB_PASSWORD=rootpassword123
 DB_NAME=appliance_registration
 
-# Redis
+# Redis (Development - No Password)
 REDIS_HOST=localhost
 REDIS_PORT=6379
+REDIS_PASSWORD=
+# Leave empty for local development, set for production
 
 # CORS
 CORS_ORIGIN=http://localhost:3000
+```
+
+### Production Environment Variables
+
+```bash
+# Production overrides
+NODE_ENV=production
+DB_HOST=your-rds-endpoint.amazonaws.com
+REDIS_HOST=your-elasticache-endpoint.amazonaws.com
+REDIS_PASSWORD=secure_production_password
+REDIS_TLS=true
 ```
 
 This microservice provides a solid foundation for scaling the RegCache pricing system while maintaining compatibility with the existing monolithic architecture.
