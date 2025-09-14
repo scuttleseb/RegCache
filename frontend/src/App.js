@@ -39,13 +39,22 @@ const ProgressivePricingForm = () => {
     setSessionId(`session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`);
   }, []);
 
-  // API base URL - adjust for your environment
+  // API URLs - Microservices configuration
   const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
+  const BASE_PRICING_URL = process.env.REACT_APP_BASE_PRICING_URL || 'http://localhost:3002';
 
-  // Real API calls to your backend
+  // Enhanced API call function with microservice routing
   const apiCall = useCallback(async (endpoint, data) => {
     try {
-      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+      let url = `${API_BASE_URL}${endpoint}`;
+      
+      // Route base pricing calls to the microservice
+      if (endpoint === '/api/pricing/base') {
+        url = `${BASE_PRICING_URL}${endpoint}`;
+        console.log(`🎯 Calling Base Pricing Microservice: ${url}`);
+      }
+      
+      const response = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -57,12 +66,19 @@ const ProgressivePricingForm = () => {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      return await response.json();
+      const result = await response.json();
+      
+      // Log microservice responses
+      if (endpoint === '/api/pricing/base' && result.metadata?.service) {
+        console.log(`✅ Base Pricing Response from: ${result.metadata.service}`);
+      }
+      
+      return result;
     } catch (error) {
       console.error(`API call failed for ${endpoint}:`, error);
       throw error;
     }
-  }, [API_BASE_URL]);
+  }, [API_BASE_URL, BASE_PRICING_URL]);
 
   // Base price calculation (manufacturer + appliance)
   useEffect(() => {
@@ -76,6 +92,7 @@ const ProgressivePricingForm = () => {
         type: formData.type,
         sessionId
       }).then(response => {
+        console.log('Base pricing response:', response);
         setPricing(prev => ({
           ...prev,
           basePrice: response.basePrice,
@@ -84,7 +101,7 @@ const ProgressivePricingForm = () => {
         }));
       }).catch(error => {
         console.error('Base pricing error:', error);
-        // Fallback to mock data if API fails
+        // Fallback to mock data if microservice fails
         const fallbackPrice = 400;
         setPricing(prev => ({
           ...prev,
@@ -242,6 +259,10 @@ const ProgressivePricingForm = () => {
       <div className="mb-8">
         <h1 className="text-3xl font-bold text-gray-900 mb-2">Appliance Registration</h1>
         <p className="text-gray-600">Get real-time pricing as you complete your registration</p>
+        {/* Development info - remove in production */}
+        <div className="mt-2 text-xs text-gray-500">
+          Base Pricing: {BASE_PRICING_URL} | Main API: {API_BASE_URL}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
