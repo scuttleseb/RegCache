@@ -1,0 +1,7 @@
+# Ignore all folders except posthog_reg
+.DS_Store
+Labels3/
+RG/
+RegCache/
+TCA/
+posthog_desktop/
